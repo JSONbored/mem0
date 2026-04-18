@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, Optional
 
 from app.database import get_db
@@ -14,6 +15,7 @@ class LLMConfig(BaseModel):
     temperature: float = Field(..., description="Temperature setting for the model")
     max_tokens: int = Field(..., description="Maximum tokens to generate")
     api_key: Optional[str] = Field(None, description="API key or 'env:API_KEY' to use environment variable")
+    openai_base_url: Optional[str] = Field(None, description="Base URL for OpenAI-compatible endpoints (e.g., http://host:11434/v1)")
     ollama_base_url: Optional[str] = Field(None, description="Base URL for Ollama server (e.g., http://host.docker.internal:11434)")
 
 class LLMProvider(BaseModel):
@@ -23,6 +25,7 @@ class LLMProvider(BaseModel):
 class EmbedderConfig(BaseModel):
     model: str = Field(..., description="Embedder model name")
     api_key: Optional[str] = Field(None, description="API key or 'env:API_KEY' to use environment variable")
+    openai_base_url: Optional[str] = Field(None, description="Base URL for OpenAI-compatible embedding endpoints (e.g., http://host:11434/v1)")
     ollama_base_url: Optional[str] = Field(None, description="Base URL for Ollama server (e.g., http://host.docker.internal:11434)")
 
 class EmbedderProvider(BaseModel):
@@ -46,28 +49,70 @@ class ConfigSchema(BaseModel):
     openmemory: Optional[OpenMemoryConfig] = None
     mem0: Optional[Mem0Config] = None
 
+
+def _model_to_dict(model: BaseModel, *, exclude_none: bool = False, exclude_unset: bool = False):
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_none=exclude_none, exclude_unset=exclude_unset)
+    return model.dict(exclude_none=exclude_none, exclude_unset=exclude_unset)
+
+
+def _default_llm_provider() -> str:
+    explicit_provider = os.getenv("LLM_PROVIDER")
+    if explicit_provider and explicit_provider.lower() != "auto":
+        return explicit_provider.lower()
+    if os.getenv("OLLAMA_BASE_URL"):
+        return "ollama"
+    return "openai"
+
+
+def _default_embedder_provider(llm_provider: str) -> str:
+    explicit_provider = os.getenv("EMBEDDER_PROVIDER")
+    if explicit_provider and explicit_provider.lower() != "auto":
+        return explicit_provider.lower()
+    if os.getenv("OLLAMA_BASE_URL") and llm_provider == "ollama":
+        return "ollama"
+    return "openai"
+
+
 def get_default_configuration():
     """Get the default configuration with sensible defaults for LLM and embedder."""
+    llm_provider = _default_llm_provider()
+    embedder_provider = _default_embedder_provider(llm_provider)
+
+    llm_config: Dict[str, Any] = {
+        "model": os.getenv("LLM_MODEL") or ("llama3.1:latest" if llm_provider == "ollama" else "gpt-4o-mini"),
+        "temperature": 0.1,
+        "max_tokens": 2000,
+    }
+    if llm_provider == "ollama":
+        llm_config["ollama_base_url"] = os.getenv("OLLAMA_BASE_URL") or os.getenv("LLM_BASE_URL") or "http://host.docker.internal:11434"
+    else:
+        llm_config["api_key"] = os.getenv("LLM_API_KEY") or "env:OPENAI_API_KEY"
+        if os.getenv("LLM_BASE_URL"):
+            llm_config["openai_base_url"] = os.getenv("LLM_BASE_URL")
+
+    embedder_config: Dict[str, Any] = {
+        "model": os.getenv("EMBEDDER_MODEL") or ("nomic-embed-text" if embedder_provider == "ollama" else "text-embedding-3-small"),
+    }
+    if embedder_provider == "ollama":
+        embedder_config["ollama_base_url"] = os.getenv("EMBEDDER_BASE_URL") or os.getenv("OLLAMA_BASE_URL") or os.getenv("LLM_BASE_URL") or "http://host.docker.internal:11434"
+    else:
+        embedder_config["api_key"] = os.getenv("EMBEDDER_API_KEY") or "env:OPENAI_API_KEY"
+        if os.getenv("EMBEDDER_BASE_URL"):
+            embedder_config["openai_base_url"] = os.getenv("EMBEDDER_BASE_URL")
+
     return {
         "openmemory": {
             "custom_instructions": None
         },
         "mem0": {
             "llm": {
-                "provider": "openai",
-                "config": {
-                    "model": "gpt-4o-mini",
-                    "temperature": 0.1,
-                    "max_tokens": 2000,
-                    "api_key": "env:OPENAI_API_KEY"
-                }
+                "provider": llm_provider,
+                "config": llm_config,
             },
             "embedder": {
-                "provider": "openai",
-                "config": {
-                    "model": "text-embedding-3-small",
-                    "api_key": "env:OPENAI_API_KEY"
-                }
+                "provider": embedder_provider,
+                "config": embedder_config,
             },
             "vector_store": None
         }
@@ -142,19 +187,20 @@ async def get_configuration(db: Session = Depends(get_db)):
 async def update_configuration(config: ConfigSchema, db: Session = Depends(get_db)):
     """Update the configuration."""
     current_config = get_config_from_db(db)
-    
+
     # Convert to dict for processing
     updated_config = current_config.copy()
-    
-    # Update openmemory settings if provided
+
+    # Replace provided sections wholesale so explicit nulls can be persisted.
     if config.openmemory is not None:
-        if "openmemory" not in updated_config:
-            updated_config["openmemory"] = {}
-        updated_config["openmemory"].update(config.openmemory.dict(exclude_none=True))
-    
-    # Update mem0 settings
-    updated_config["mem0"] = config.mem0.dict(exclude_none=True)
-    
+        updated_config["openmemory"] = _model_to_dict(config.openmemory)
+
+    if config.mem0 is not None:
+        updated_config["mem0"] = _model_to_dict(config.mem0)
+
+    save_config_to_db(db, updated_config)
+    reset_memory_client()
+    return updated_config
 
 @router.patch("/", response_model=ConfigSchema)
 async def patch_configuration(config_update: ConfigSchema, db: Session = Depends(get_db)):
@@ -169,7 +215,7 @@ async def patch_configuration(config_update: ConfigSchema, db: Session = Depends
                 source[key] = value
         return source
 
-    update_data = config_update.dict(exclude_unset=True)
+    update_data = _model_to_dict(config_update, exclude_unset=True)
     updated_config = deep_update(current_config, update_data)
 
     save_config_to_db(db, updated_config)
@@ -211,7 +257,7 @@ async def update_llm_configuration(llm_config: LLMProvider, db: Session = Depend
         current_config["mem0"] = {}
     
     # Update the LLM configuration
-    current_config["mem0"]["llm"] = llm_config.dict(exclude_none=True)
+    current_config["mem0"]["llm"] = _model_to_dict(llm_config, exclude_none=True)
     
     # Save the configuration to database
     save_config_to_db(db, current_config)
@@ -235,7 +281,7 @@ async def update_embedder_configuration(embedder_config: EmbedderProvider, db: S
         current_config["mem0"] = {}
     
     # Update the Embedder configuration
-    current_config["mem0"]["embedder"] = embedder_config.dict(exclude_none=True)
+    current_config["mem0"]["embedder"] = _model_to_dict(embedder_config, exclude_none=True)
     
     # Save the configuration to database
     save_config_to_db(db, current_config)

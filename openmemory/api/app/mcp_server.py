@@ -61,6 +61,146 @@ mcp_router = APIRouter(prefix="/mcp")
 # Initialize SSE transport
 sse = SseServerTransport("/mcp/messages/")
 
+
+def _extract_memory_results(response) -> list[dict]:
+    """Normalize Mem0 responses into a list of memory records."""
+    if isinstance(response, dict):
+        results = response.get("results")
+        return results if isinstance(results, list) else []
+    if isinstance(response, list):
+        return [item for item in response if isinstance(item, dict)]
+    return []
+
+
+def _normalize_memory_record(record: dict) -> dict:
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    return {
+        "id": record.get("id"),
+        "memory": record.get("memory") or record.get("data"),
+        "hash": record.get("hash") or metadata.get("hash"),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+        "score": record.get("score"),
+    }
+
+
+def _score_memory_match(memory_text: str | None, query: str) -> float | None:
+    """Assign a lightweight lexical score for local search fallbacks."""
+    if not memory_text:
+        return None
+
+    normalized_memory = memory_text.casefold()
+    normalized_query = query.casefold().strip()
+    if not normalized_query:
+        return None
+
+    if normalized_query in normalized_memory:
+        return 1.0
+
+    query_terms = [term for term in normalized_query.split() if term]
+    if not query_terms:
+        return None
+
+    matches = sum(1 for term in query_terms if term in normalized_memory)
+    if matches == 0:
+        return None
+    return matches / len(query_terms)
+
+
+def _search_memories_via_client(memory_client, query: str, user_id: str) -> list[dict]:
+    """Use the public Mem0 client search API with compatibility fallbacks."""
+    attempts = (
+        lambda: memory_client.search(query, filters={"user_id": user_id}),
+        lambda: memory_client.search(query, user_id=user_id),
+        lambda: memory_client.search(query),
+    )
+
+    last_error = None
+    for attempt in attempts:
+        try:
+            return [_normalize_memory_record(item) for item in _extract_memory_results(attempt())]
+        except (AttributeError, TypeError, ValueError) as exc:
+            last_error = exc
+            logging.info("Falling back to alternate Mem0 search signature: %s", exc)
+
+    if last_error:
+        raise last_error
+    return []
+
+
+def _list_memories_via_client(memory_client, user_id: str) -> list[dict]:
+    """Use the public Mem0 client get_all API with compatibility fallbacks."""
+    attempts = (
+        lambda: memory_client.get_all(filters={"user_id": user_id}),
+        lambda: memory_client.get_all(user_id=user_id),
+        lambda: memory_client.get_all(),
+    )
+
+    last_error = None
+    for attempt in attempts:
+        try:
+            return [_normalize_memory_record(item) for item in _extract_memory_results(attempt())]
+        except (AttributeError, TypeError, ValueError) as exc:
+            last_error = exc
+            logging.info("Falling back to alternate Mem0 get_all signature: %s", exc)
+
+    if last_error:
+        raise last_error
+    return []
+
+
+def _search_memories_from_list(memory_client, query: str, user_id: str) -> list[dict]:
+    """Fallback search that derives results from get_all when search is unusable."""
+    ranked_results = []
+    for record in _list_memories_via_client(memory_client, user_id):
+        score = _score_memory_match(record.get("memory"), query)
+        if score is None:
+            continue
+
+        ranked_record = dict(record)
+        ranked_record["score"] = score
+        ranked_results.append(ranked_record)
+
+    return sorted(ranked_results, key=lambda item: item.get("score") or 0, reverse=True)
+
+
+def _records_from_db_rows(rows) -> list[dict]:
+    def _json_safe_timestamp(value):
+        if isinstance(value, (datetime.datetime, datetime.date)):
+            return value.isoformat()
+        return value
+
+    records = []
+    for row in rows:
+        records.append(
+            {
+                "id": str(row.id),
+                "memory": getattr(row, "content", None),
+                "hash": getattr(row, "content_hash", None),
+                "created_at": _json_safe_timestamp(getattr(row, "created_at", None)),
+                "updated_at": _json_safe_timestamp(getattr(row, "updated_at", None)),
+                "score": None,
+            }
+        )
+    return records
+
+
+def _search_db_records(rows, query: str) -> list[dict]:
+    ranked_results = []
+    for record in _records_from_db_rows(rows):
+        score = _score_memory_match(record.get("memory"), query)
+        if score is None:
+            continue
+
+        ranked_record = dict(record)
+        ranked_record["score"] = score
+        ranked_results.append(ranked_record)
+
+    return sorted(ranked_results, key=lambda item: item.get("score") or 0, reverse=True)
+
 @mcp.tool(description="Add a new memory. This method is called everytime the user informs anything about themselves, their preferences, or anything that has any relevant information which can be useful in the future conversation. This can also be called when the user asks you to remember something. Set infer to False to store the memory verbatim without LLM fact extraction.")
 async def add_memories(text: str, infer: bool = True) -> str:
     uid = user_id_var.get(None)
@@ -168,38 +308,39 @@ async def search_memory(query: str) -> str:
 
             # Get accessible memory IDs based on ACL
             user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
-            accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
+            accessible_memories = [memory for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
+            accessible_memory_ids = [memory.id for memory in accessible_memories]
 
-            filters = {
-                "user_id": uid
-            }
+            allowed = set(str(mid) for mid in accessible_memory_ids)
+            if not allowed:
+                return json.dumps({"results": []}, indent=2)
 
-            embeddings = memory_client.embedding_model.embed(query, "search")
-
-            hits = memory_client.vector_store.search(
-                query=query, 
-                vectors=embeddings, 
-                limit=10, 
-                filters=filters,
-            )
-
-            allowed = set(str(mid) for mid in accessible_memory_ids) if accessible_memory_ids else None
+            try:
+                raw_results = _search_memories_via_client(memory_client, query, uid)
+            except (AttributeError, TypeError, ValueError) as exc:
+                logging.warning("Mem0 search API unavailable, falling back to get_all-based search: %s", exc)
+                raw_results = _search_memories_from_list(memory_client, query, uid)
 
             results = []
-            for h in hits:
-                # All vector db search functions return OutputData class
-                id, score, payload = h.id, h.score, h.payload
-                if allowed and (h.id is None or h.id not in allowed):
+            for record in raw_results:
+                memory_id = record.get("id")
+                if memory_id is None or memory_id not in allowed:
                     continue
-                
-                results.append({
-                    "id": id, 
-                    "memory": payload.get("data"), 
-                    "hash": payload.get("hash"),
-                    "created_at": payload.get("created_at"), 
-                    "updated_at": payload.get("updated_at"), 
-                    "score": score,
-                })
+
+                results.append(record)
+
+            if not results:
+                logging.info("Mem0 search returned no accessible results, falling back to get_all-based search")
+                fallback_results = _search_memories_from_list(memory_client, query, uid)
+                for record in fallback_results:
+                    memory_id = record.get("id")
+                    if memory_id is None or memory_id not in allowed:
+                        continue
+                    results.append(record)
+
+            if not results:
+                logging.info("Mem0 search fallback returned no results, falling back to database-backed lexical search")
+                results = _search_db_records(accessible_memories, query)
 
             for r in results: 
                 if r.get("id"): 
@@ -244,47 +385,49 @@ async def list_memories() -> str:
             # Get or create user and app
             user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
 
+            user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
+            accessible_memories = [memory for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
+            accessible_memory_ids = [memory.id for memory in accessible_memories]
+
             # Get all memories
-            memories = memory_client.get_all(user_id=uid)
+            memories = _list_memories_via_client(memory_client, uid)
             filtered_memories = []
 
-            # Filter memories based on permissions
-            user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
-            accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
-            if isinstance(memories, dict) and 'results' in memories:
-                for memory_data in memories['results']:
-                    if 'id' in memory_data:
-                        memory_id = uuid.UUID(memory_data['id'])
-                        if memory_id in accessible_memory_ids:
-                            # Create access log entry
-                            access_log = MemoryAccessLog(
-                                memory_id=memory_id,
-                                app_id=app.id,
-                                access_type="list",
-                                metadata_={
-                                    "hash": memory_data.get('hash')
-                                }
-                            )
-                            db.add(access_log)
-                            filtered_memories.append(memory_data)
-                db.commit()
-            else:
-                for memory in memories:
-                    memory_id = uuid.UUID(memory['id'])
-                    memory_obj = db.query(Memory).filter(Memory.id == memory_id).first()
-                    if memory_obj and check_memory_access_permissions(db, memory_obj, app.id):
-                        # Create access log entry
-                        access_log = MemoryAccessLog(
-                            memory_id=memory_id,
-                            app_id=app.id,
-                            access_type="list",
-                            metadata_={
-                                "hash": memory.get('hash')
-                            }
-                        )
-                        db.add(access_log)
-                        filtered_memories.append(memory)
-                db.commit()
+            for memory in memories:
+                memory_id = memory.get("id")
+                if not memory_id:
+                    continue
+
+                memory_uuid = uuid.UUID(memory_id)
+                if memory_uuid not in accessible_memory_ids:
+                    continue
+
+                access_log = MemoryAccessLog(
+                    memory_id=memory_uuid,
+                    app_id=app.id,
+                    access_type="list",
+                    metadata_={
+                        "hash": memory.get("hash")
+                    }
+                )
+                db.add(access_log)
+                filtered_memories.append(memory)
+
+            if not filtered_memories:
+                logging.info("Mem0 get_all returned no accessible results, falling back to database-backed list")
+                filtered_memories = _records_from_db_rows(accessible_memories)
+                for memory in filtered_memories:
+                    access_log = MemoryAccessLog(
+                        memory_id=uuid.UUID(memory["id"]),
+                        app_id=app.id,
+                        access_type="list",
+                        metadata_={
+                            "hash": memory.get("hash")
+                        }
+                    )
+                    db.add(access_log)
+
+            db.commit()
             return json.dumps(filtered_memories, indent=2)
         finally:
             db.close()
