@@ -26,6 +26,7 @@ from app.routers.config import (
 from app.utils.memory import (
     _drop_none_entries,
     _ensure_vector_store_dimensions,
+    _normalize_qdrant_config,
     _repair_qdrant_collection_if_needed,
     get_default_memory_config,
 )
@@ -528,6 +529,64 @@ def test_ensure_vector_store_dimensions_uses_openai_compatible_probe(monkeypatch
     updated = _ensure_vector_store_dimensions(config)
 
     assert updated["vector_store"]["config"]["embedding_model_dims"] == 768
+
+
+def test_default_qdrant_config_uses_url_and_redacts_api_key(monkeypatch, capsys):
+    monkeypatch.setenv("QDRANT_URL", "http://qdrant:6333")
+    monkeypatch.setenv("QDRANT_API_KEY", "secret-qdrant-key")
+    monkeypatch.setenv("QDRANT_HOST", "qdrant")
+    monkeypatch.setenv("QDRANT_PORT", "6333")
+
+    config = get_default_memory_config()
+    vector_config = config["vector_store"]["config"]
+
+    assert config["vector_store"]["provider"] == "qdrant"
+    assert vector_config["url"] == "http://qdrant:6333"
+    assert vector_config["api_key"] == "secret-qdrant-key"
+    assert "host" not in vector_config
+    assert "port" not in vector_config
+
+    captured = capsys.readouterr()
+    assert "secret-qdrant-key" not in captured.out
+    assert "<redacted>" in captured.out
+
+
+def test_default_qdrant_config_normalizes_host_port_with_api_key(monkeypatch):
+    monkeypatch.delenv("QDRANT_URL", raising=False)
+    monkeypatch.setenv("QDRANT_API_KEY", "secret-qdrant-key")
+    monkeypatch.setenv("QDRANT_HOST", "qdrant")
+    monkeypatch.setenv("QDRANT_PORT", "6333")
+
+    config = get_default_memory_config()
+    vector_config = config["vector_store"]["config"]
+
+    assert config["vector_store"]["provider"] == "qdrant"
+    assert vector_config["url"] == "http://qdrant:6333"
+    assert vector_config["api_key"] == "secret-qdrant-key"
+    assert "host" not in vector_config
+    assert "port" not in vector_config
+
+
+def test_normalize_qdrant_config_converts_authenticated_host_port_to_http_url():
+    config = {
+        "vector_store": {
+            "provider": "qdrant",
+            "config": {
+                "collection_name": "openmemory",
+                "host": "qdrant",
+                "port": 6333,
+                "api_key": "secret-qdrant-key",
+            },
+        }
+    }
+
+    normalized = _normalize_qdrant_config(config)
+    vector_config = normalized["vector_store"]["config"]
+
+    assert vector_config["url"] == "http://qdrant:6333"
+    assert vector_config["api_key"] == "secret-qdrant-key"
+    assert "host" not in vector_config
+    assert "port" not in vector_config
 
 
 def test_repair_qdrant_collection_deletes_empty_mismatched_collection(monkeypatch):

@@ -294,6 +294,41 @@ def _drop_none_entries(value):
     return value
 
 
+def _redact_sensitive_config(value):
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if key.lower() in {"api_key", "password", "token"} and item:
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = _redact_sensitive_config(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive_config(item) for item in value]
+    return value
+
+
+def _normalize_qdrant_config(config: dict) -> dict:
+    vector_store = config.get("vector_store") or {}
+    if (vector_store.get("provider") or "").lower() != "qdrant":
+        return config
+
+    vector_store_config = vector_store.get("config") or {}
+    if (
+        vector_store_config.get("api_key")
+        and not vector_store_config.get("url")
+        and vector_store_config.get("host")
+        and vector_store_config.get("port")
+    ):
+        host = str(vector_store_config.pop("host")).strip()
+        port = int(vector_store_config.pop("port"))
+        if host.startswith(("http://", "https://")):
+            vector_store_config["url"] = f"{host.rstrip('/')}:{port}"
+        else:
+            vector_store_config["url"] = f"http://{host}:{port}"
+    return config
+
+
 def _ensure_vector_store_dimensions(config: dict) -> dict:
     vector_store = config.get("vector_store") or {}
     if (vector_store.get("provider") or "").lower() not in {
@@ -574,12 +609,27 @@ def get_default_memory_config():
             "embedding_model_dims": 1536,
             "distance_strategy": "cosine"
         }
-    elif os.environ.get('QDRANT_HOST') and os.environ.get('QDRANT_PORT'):
+    elif os.environ.get('QDRANT_URL') or (
+        os.environ.get('QDRANT_HOST') and os.environ.get('QDRANT_PORT')
+    ):
         vector_store_provider = "qdrant"
-        vector_store_config.update({
-            "host": os.environ.get('QDRANT_HOST'),
-            "port": int(os.environ.get('QDRANT_PORT'))
-        })
+        qdrant_url = os.environ.get('QDRANT_URL')
+        qdrant_api_key = os.environ.get('QDRANT_API_KEY')
+        if qdrant_url:
+            vector_store_config.pop("host", None)
+            vector_store_config["url"] = qdrant_url
+        elif qdrant_api_key:
+            vector_store_config.pop("host", None)
+            qdrant_host = os.environ.get('QDRANT_HOST')
+            qdrant_port = int(os.environ.get('QDRANT_PORT'))
+            vector_store_config["url"] = f"http://{qdrant_host}:{qdrant_port}"
+        else:
+            vector_store_config.update({
+                "host": os.environ.get('QDRANT_HOST'),
+                "port": int(os.environ.get('QDRANT_PORT'))
+            })
+        if qdrant_api_key:
+            vector_store_config["api_key"] = qdrant_api_key
     else:
         # Default fallback to Qdrant
         vector_store_provider = "qdrant"
@@ -587,7 +637,10 @@ def get_default_memory_config():
             "port": 6333,
         })
     
-    print(f"Auto-detected vector store: {vector_store_provider} with config: {vector_store_config}")
+    print(
+        "Auto-detected vector store: "
+        f"{vector_store_provider} with config: {_redact_sensitive_config(vector_store_config)}"
+    )
 
     # Detect LLM provider from environment variables
     llm_provider = _env_provider('LLM_PROVIDER') or ('ollama' if os.environ.get('OLLAMA_BASE_URL') else 'openai')
@@ -734,6 +787,7 @@ def get_memory_client(custom_instructions: str = None):
         if config.get("embedder", {}).get("provider") == "ollama":
             config["embedder"] = _fix_ollama_urls(config["embedder"])
 
+        config = _normalize_qdrant_config(config)
         config = _ensure_vector_store_dimensions(config)
 
         # ALWAYS parse environment variables in the final config
