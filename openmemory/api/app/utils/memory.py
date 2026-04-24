@@ -31,14 +31,23 @@ import hashlib
 import json
 import os
 import socket
+import urllib.error
+import urllib.request
 
 from app.database import SessionLocal
-from app.models import Config as ConfigModel
+from app.models import Config as ConfigModel, Memory as MemoryModel, MemoryState
+from qdrant_client import QdrantClient
 
 from mem0 import Memory
 
 _memory_client = None
 _config_hash = None
+
+_OPENAI_EMBEDDING_DIMS = {
+    "text-embedding-3-large": 3072,
+    "text-embedding-3-small": 1536,
+    "text-embedding-ada-002": 1536,
+}
 
 
 def _get_config_hash(config_dict):
@@ -131,6 +140,287 @@ def reset_memory_client():
     global _memory_client, _config_hash
     _memory_client = None
     _config_hash = None
+
+
+def _guess_embedding_dimensions(provider: str, model: str | None) -> int:
+    normalized_provider = (provider or "").lower()
+    normalized_model = (model or "").strip().lower()
+
+    if normalized_provider == "openai":
+        return _OPENAI_EMBEDDING_DIMS.get(normalized_model, 1536)
+
+    if normalized_provider == "ollama":
+        if "nomic-embed-text" in normalized_model:
+            return 768
+        if "mxbai-embed-large" in normalized_model:
+            return 1024
+        if "snowflake-arctic-embed" in normalized_model:
+            return 1024
+
+    return 1536
+
+
+def _probe_ollama_embedding_dimensions(model: str | None, base_url: str | None) -> int | None:
+    if not model or not base_url:
+        return None
+
+    url = f"{base_url.rstrip('/')}/api/embed"
+    payload = json.dumps({"model": model, "input": "dimension probe"}).encode()
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            body = json.loads(response.read().decode())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        print(f"Warning: Failed to probe Ollama embedding dimensions from {url}: {error}")
+        return None
+
+    embeddings = body.get("embeddings") or []
+    if embeddings and isinstance(embeddings[0], list):
+        return len(embeddings[0])
+    return None
+
+
+def _resolve_env_api_key(value: str | None) -> str | None:
+    if not value:
+        return None
+    if isinstance(value, str) and value.startswith("env:"):
+        return os.environ.get(value.split(":", 1)[1])
+    return value
+
+
+def _probe_openai_compatible_embedding_dimensions(
+    model: str | None,
+    base_url: str | None,
+    api_key: str | None,
+) -> int | None:
+    if not model or not base_url:
+        return None
+
+    url = f"{base_url.rstrip('/')}/embeddings"
+    headers = {"Content-Type": "application/json"}
+    resolved_api_key = _resolve_env_api_key(api_key)
+    if resolved_api_key:
+        headers["Authorization"] = f"Bearer {resolved_api_key}"
+
+    payload = json.dumps({"model": model, "input": "dimension probe"}).encode()
+    request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            body = json.loads(response.read().decode())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        print(f"Warning: Failed to probe OpenAI-compatible embedding dimensions from {url}: {error}")
+        return None
+
+    data = body.get("data") or []
+    if data and isinstance(data[0], dict) and isinstance(data[0].get("embedding"), list):
+        return len(data[0]["embedding"])
+    return None
+
+
+def _resolve_embedding_dimensions(provider: str, embedder_config: dict | None) -> int:
+    explicit_dims = os.environ.get("EMBEDDER_DIMENSIONS")
+    if explicit_dims:
+        try:
+            return int(explicit_dims)
+        except ValueError:
+            print(f"Warning: Invalid EMBEDDER_DIMENSIONS value '{explicit_dims}', falling back to auto-detection")
+
+    embedder_config = embedder_config or {}
+    config_values = embedder_config.get("config", {})
+
+    for key in ("embedding_dims", "embedding_model_dims"):
+        value = config_values.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                print(f"Warning: Invalid {key} value '{value}', falling back to auto-detection")
+
+    normalized_provider = (provider or "").lower()
+
+    if normalized_provider == "ollama":
+        probed_dims = _probe_ollama_embedding_dimensions(
+            model=config_values.get("model"),
+            base_url=config_values.get("ollama_base_url"),
+        )
+        if probed_dims:
+            return probed_dims
+
+    if normalized_provider == "openai":
+        probed_dims = _probe_openai_compatible_embedding_dimensions(
+            model=config_values.get("model"),
+            base_url=config_values.get("openai_base_url"),
+            api_key=config_values.get("api_key"),
+        )
+        if probed_dims:
+            return probed_dims
+
+    return _guess_embedding_dimensions(provider, config_values.get("model"))
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_provider(name: str) -> str | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    normalized = value.strip().lower()
+    if normalized == "auto":
+        return None
+    return normalized
+
+
+def _drop_none_entries(value):
+    if isinstance(value, dict):
+        return {
+            key: _drop_none_entries(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if isinstance(value, list):
+        return [_drop_none_entries(item) for item in value]
+    return value
+
+
+def _redact_sensitive_config(value):
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if key.lower() in {"api_key", "password", "token"} and item:
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = _redact_sensitive_config(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive_config(item) for item in value]
+    return value
+
+
+def _normalize_qdrant_config(config: dict) -> dict:
+    vector_store = config.get("vector_store") or {}
+    if (vector_store.get("provider") or "").lower() != "qdrant":
+        return config
+
+    vector_store_config = vector_store.get("config") or {}
+    if (
+        vector_store_config.get("api_key")
+        and not vector_store_config.get("url")
+        and vector_store_config.get("host")
+        and vector_store_config.get("port")
+    ):
+        host = str(vector_store_config.pop("host")).strip()
+        port = int(vector_store_config.pop("port"))
+        if host.startswith(("http://", "https://")):
+            vector_store_config["url"] = f"{host.rstrip('/')}:{port}"
+        else:
+            vector_store_config["url"] = f"http://{host}:{port}"
+    return config
+
+
+def _ensure_vector_store_dimensions(config: dict) -> dict:
+    vector_store = config.get("vector_store") or {}
+    if (vector_store.get("provider") or "").lower() not in {
+        "qdrant",
+        "pgvector",
+        "milvus",
+        "elasticsearch",
+        "opensearch",
+        "faiss",
+        "redis",
+    }:
+        return config
+
+    vector_store_config = vector_store.setdefault("config", {})
+    vector_store_config["embedding_model_dims"] = _resolve_embedding_dimensions(
+        provider=config.get("embedder", {}).get("provider"),
+        embedder_config=config.get("embedder"),
+    )
+    return config
+
+
+def _extract_qdrant_collection_dims(collection_info) -> int | None:
+    vectors = getattr(collection_info.config.params, "vectors", None)
+    if vectors is None:
+        return None
+    if hasattr(vectors, "size"):
+        return vectors.size
+    if isinstance(vectors, dict):
+        unnamed = vectors.get("")
+        if isinstance(unnamed, dict):
+            return unnamed.get("size")
+        if hasattr(unnamed, "size"):
+            return unnamed.size
+    return None
+
+
+def _count_active_memories() -> int:
+    db = SessionLocal()
+    try:
+        return (
+            db.query(MemoryModel)
+            .filter(MemoryModel.state.notin_([MemoryState.deleted, MemoryState.archived]))
+            .count()
+        )
+    finally:
+        db.close()
+
+
+def _repair_qdrant_collection_if_needed(config: dict) -> dict:
+    vector_store = config.get("vector_store") or {}
+    if (vector_store.get("provider") or "").lower() != "qdrant":
+        return config
+
+    vector_store_config = vector_store.get("config", {})
+    collection_name = vector_store_config.get("collection_name")
+    expected_dims = vector_store_config.get("embedding_model_dims")
+    if not collection_name or expected_dims is None:
+        return config
+
+    client_kwargs = {}
+    for key in ("host", "port", "url", "api_key", "path"):
+        value = vector_store_config.get(key)
+        if value is not None:
+            client_kwargs[key] = value
+
+    try:
+        client = QdrantClient(**client_kwargs)
+        if not client.collection_exists(collection_name):
+            return config
+
+        collection_info = client.get_collection(collection_name)
+        actual_dims = _extract_qdrant_collection_dims(collection_info)
+        if actual_dims in (None, expected_dims):
+            return config
+
+        memory_count = _count_active_memories()
+        if memory_count == 0:
+            print(
+                f"Resetting empty Qdrant collection '{collection_name}' "
+                f"to repair embedding dimension mismatch ({actual_dims} -> {expected_dims})"
+            )
+            client.delete_collection(collection_name)
+        else:
+            print(
+                f"Warning: Qdrant collection '{collection_name}' uses dimension {actual_dims}, "
+                f"but current embedder expects {expected_dims}. Existing memories detected "
+                f"({memory_count}); not resetting collection automatically."
+            )
+    except Exception as error:
+        print(f"Warning: Failed to inspect or repair Qdrant collection '{collection_name}': {error}")
+
+    return config
 
 
 # --- LLM provider config factories ---
@@ -239,12 +529,6 @@ def get_default_memory_config():
             "host": os.environ.get('CHROMA_HOST'),
             "port": int(os.environ.get('CHROMA_PORT'))
         })
-    elif os.environ.get('QDRANT_HOST') and os.environ.get('QDRANT_PORT'):
-        vector_store_provider = "qdrant"
-        vector_store_config.update({
-            "host": os.environ.get('QDRANT_HOST'),
-            "port": int(os.environ.get('QDRANT_PORT'))
-        })
     elif os.environ.get('WEAVIATE_CLUSTER_URL') or (os.environ.get('WEAVIATE_HOST') and os.environ.get('WEAVIATE_PORT')):
         vector_store_provider = "weaviate"
         # Prefer an explicit cluster URL if provided; otherwise build from host/port
@@ -289,27 +573,34 @@ def get_default_memory_config():
         }
     elif os.environ.get('ELASTICSEARCH_HOST') and os.environ.get('ELASTICSEARCH_PORT'):
         vector_store_provider = "elasticsearch"
-        # Construct the full URL with scheme since Elasticsearch client expects it
         elasticsearch_host = os.environ.get('ELASTICSEARCH_HOST')
         elasticsearch_port = int(os.environ.get('ELASTICSEARCH_PORT'))
-        # Use http:// scheme since we're not using SSL
-        full_host = f"http://{elasticsearch_host}"
-        
+        elasticsearch_use_ssl = _env_flag('ELASTICSEARCH_USE_SSL', default=True)
+        elasticsearch_verify_certs = _env_flag('ELASTICSEARCH_VERIFY_CERTS', default=False)
+
         vector_store_config.update({
-            "host": full_host,
+            "host": f"{'https' if elasticsearch_use_ssl else 'http'}://{elasticsearch_host}",
             "port": elasticsearch_port,
-            "user": os.environ.get('ELASTICSEARCH_USER', 'elastic'),
-            "password": os.environ.get('ELASTICSEARCH_PASSWORD', 'changeme'),
-            "verify_certs": False,
-            "use_ssl": False,
+            "verify_certs": elasticsearch_verify_certs,
+            "use_ssl": elasticsearch_use_ssl,
             "embedding_model_dims": 1536
         })
+        if os.environ.get('ELASTICSEARCH_USER'):
+            vector_store_config["user"] = os.environ.get('ELASTICSEARCH_USER')
+        if os.environ.get('ELASTICSEARCH_PASSWORD'):
+            vector_store_config["password"] = os.environ.get('ELASTICSEARCH_PASSWORD')
     elif os.environ.get('OPENSEARCH_HOST') and os.environ.get('OPENSEARCH_PORT'):
         vector_store_provider = "opensearch"
         vector_store_config.update({
             "host": os.environ.get('OPENSEARCH_HOST'),
-            "port": int(os.environ.get('OPENSEARCH_PORT'))
+            "port": int(os.environ.get('OPENSEARCH_PORT')),
+            "use_ssl": _env_flag('OPENSEARCH_USE_SSL', default=True),
+            "verify_certs": _env_flag('OPENSEARCH_VERIFY_CERTS', default=False),
         })
+        if os.environ.get('OPENSEARCH_USER'):
+            vector_store_config["user"] = os.environ.get('OPENSEARCH_USER')
+        if os.environ.get('OPENSEARCH_PASSWORD'):
+            vector_store_config["password"] = os.environ.get('OPENSEARCH_PASSWORD')
     elif os.environ.get('FAISS_PATH'):
         vector_store_provider = "faiss"
         vector_store_config = {
@@ -318,6 +609,27 @@ def get_default_memory_config():
             "embedding_model_dims": 1536,
             "distance_strategy": "cosine"
         }
+    elif os.environ.get('QDRANT_URL') or (
+        os.environ.get('QDRANT_HOST') and os.environ.get('QDRANT_PORT')
+    ):
+        vector_store_provider = "qdrant"
+        qdrant_url = os.environ.get('QDRANT_URL')
+        qdrant_api_key = os.environ.get('QDRANT_API_KEY')
+        if qdrant_url:
+            vector_store_config.pop("host", None)
+            vector_store_config["url"] = qdrant_url
+        elif qdrant_api_key:
+            vector_store_config.pop("host", None)
+            qdrant_host = os.environ.get('QDRANT_HOST')
+            qdrant_port = int(os.environ.get('QDRANT_PORT'))
+            vector_store_config["url"] = f"http://{qdrant_host}:{qdrant_port}"
+        else:
+            vector_store_config.update({
+                "host": os.environ.get('QDRANT_HOST'),
+                "port": int(os.environ.get('QDRANT_PORT'))
+            })
+        if qdrant_api_key:
+            vector_store_config["api_key"] = qdrant_api_key
     else:
         # Default fallback to Qdrant
         vector_store_provider = "qdrant"
@@ -325,10 +637,13 @@ def get_default_memory_config():
             "port": 6333,
         })
     
-    print(f"Auto-detected vector store: {vector_store_provider} with config: {vector_store_config}")
+    print(
+        "Auto-detected vector store: "
+        f"{vector_store_provider} with config: {_redact_sensitive_config(vector_store_config)}"
+    )
 
     # Detect LLM provider from environment variables
-    llm_provider = os.environ.get('LLM_PROVIDER', 'openai').lower()
+    llm_provider = _env_provider('LLM_PROVIDER') or ('ollama' if os.environ.get('OLLAMA_BASE_URL') else 'openai')
     llm_model = os.environ.get('LLM_MODEL')
     llm_api_key = os.environ.get('LLM_API_KEY')
     llm_base_url = os.environ.get('LLM_BASE_URL')
@@ -344,7 +659,9 @@ def get_default_memory_config():
     print(f"Auto-detected LLM provider: {llm_provider}")
 
     # Detect embedder provider from environment variables
-    embedder_provider = os.environ.get('EMBEDDER_PROVIDER', llm_provider if llm_provider == 'ollama' else 'openai').lower()
+    embedder_provider = _env_provider('EMBEDDER_PROVIDER') or (
+        'ollama' if os.environ.get('OLLAMA_BASE_URL') and llm_provider == 'ollama' else 'openai'
+    )
     embedder_model = os.environ.get('EMBEDDER_MODEL')
     embedder_api_key = os.environ.get('EMBEDDER_API_KEY')
     embedder_base_url = os.environ.get('EMBEDDER_BASE_URL')
@@ -470,10 +787,18 @@ def get_memory_client(custom_instructions: str = None):
         if config.get("embedder", {}).get("provider") == "ollama":
             config["embedder"] = _fix_ollama_urls(config["embedder"])
 
+        config = _normalize_qdrant_config(config)
+        config = _ensure_vector_store_dimensions(config)
+
         # ALWAYS parse environment variables in the final config
         # This ensures that even default config values like "env:OPENAI_API_KEY" get parsed
         print("Parsing environment variables in final config...")
         config = _parse_environment_variables(config)
+        for section_name in ("llm", "embedder", "vector_store"):
+            section = config.get(section_name)
+            if isinstance(section, dict):
+                config[section_name] = _drop_none_entries(section)
+        config = _repair_qdrant_collection_if_needed(config)
 
         # Check if config has changed by comparing hashes
         current_config_hash = _get_config_hash(config)
